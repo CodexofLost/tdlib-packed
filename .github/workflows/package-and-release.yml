@@ -1,0 +1,295 @@
+name: Package & Release TDLib
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force re-packaging even if version matches release'
+        required: false
+        default: false
+        type: boolean
+  schedule:
+    - cron: '0 0 * * *' # Every 24 hours at 00:00 UTC
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/**'
+      - 'README.md'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  package-and-release:
+    name: Fetch Prebuilts & Create Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check TDLib version & early exit
+        id: version_check
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "=== Checking Upstream TDLib Version ==="
+          
+          # 1. Fetch upstream TDLib commit hash directly from TGX-Android/tdlib
+          COMMIT_HASH=$(curl -sL "https://raw.githubusercontent.com/TGX-Android/tdlib/main/version.txt" | tr -d '[:space:]')
+          if [ -z "$COMMIT_HASH" ]; then
+            echo "ERROR: Failed to retrieve version.txt from TGX-Android/tdlib"
+            exit 1
+          fi
+          SHORT_COMMIT=$(echo "$COMMIT_HASH" | cut -c 1-7)
+          echo "Upstream TDLib commit: $COMMIT_HASH ($SHORT_COMMIT)"
+
+          # 2. Extract TDLib semantic version from tdlib/td CMakeLists.txt
+          TDLIB_VER=$(curl -sL "https://raw.githubusercontent.com/tdlib/td/${COMMIT_HASH}/CMakeLists.txt" | grep -m1 "project(TDLib VERSION" | sed -E 's/.*VERSION ([0-9.]+).*/\1/' || true)
+          if [ -z "$TDLIB_VER" ]; then
+            TDLIB_VER="1.8.67"
+          fi
+          echo "Upstream TDLib SemVer: $TDLIB_VER"
+
+          ZIP_FILENAME="tdlib-v${TDLIB_VER}.zip"
+          RELEASE_TAG="v${TDLIB_VER}"
+
+          # 3. Check if release and matching zip already exist
+          FORCE="${{ github.event.inputs.force }}"
+          if [ "$FORCE" != "true" ]; then
+            RELEASE_ASSETS=$(gh release view "$RELEASE_TAG" --json assets -q '.assets[].name' 2>/dev/null || true)
+            if echo "$RELEASE_ASSETS" | grep -q "^${ZIP_FILENAME}$"; then
+              echo "✅ Early exit: TDLib version $TDLIB_VER ($ZIP_FILENAME) already matches the release section ($RELEASE_TAG)."
+              echo "should_run=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+          fi
+
+          echo "Proceeding with build: new version detected or force re-package requested ($ZIP_FILENAME)."
+          echo "should_run=true" >> $GITHUB_OUTPUT
+          echo "tdlib_version=$TDLIB_VER" >> $GITHUB_OUTPUT
+          echo "commit_hash=$COMMIT_HASH" >> $GITHUB_OUTPUT
+          echo "short_commit=$SHORT_COMMIT" >> $GITHUB_OUTPUT
+          echo "zip_filename=$ZIP_FILENAME" >> $GITHUB_OUTPUT
+          echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Fetch prebuilt TDLib and OpenSSL from TGX-Android
+        if: steps.version_check.outputs.should_run == 'true'
+        run: |
+          echo "Cloning TGX-Android/tdlib..."
+          git clone --depth 1 https://github.com/TGX-Android/tdlib.git upstream
+          cd upstream
+          echo "Pulling Git LFS binary blobs..."
+          git lfs pull
+          cd ..
+          echo "Upstream fetch complete."
+
+      - name: Assemble TDLib bundle
+        if: steps.version_check.outputs.should_run == 'true'
+        run: |
+          # Detect the latest NDK directory in upstream/src/main/libs/
+          NDK_DIR=$(basename $(ls -1d upstream/src/main/libs/*/ | sort -V | tail -n 1))
+          echo "Detected latest upstream NDK folder: $NDK_DIR"
+
+          BUNDLE_DIR="bundle"
+          rm -rf "$BUNDLE_DIR"
+          mkdir -p "$BUNDLE_DIR/libs/arm64-v8a"
+          mkdir -p "$BUNDLE_DIR/libs/armeabi-v7a"
+          mkdir -p "$BUNDLE_DIR/libs/x86_64"
+          mkdir -p "$BUNDLE_DIR/libs/x86"
+          mkdir -p "$BUNDLE_DIR/java/org/drinkless/tdlib"
+
+          # 1. Copy Java source bindings
+          echo "Copying Java bindings..."
+          cp -v upstream/src/main/java/org/drinkless/tdlib/*.java "$BUNDLE_DIR/java/org/drinkless/tdlib/"
+
+          # 2. Locate Android NDK for libc++_shared.so
+          NDK_PATH=$(find "$ANDROID_HOME/ndk" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
+          echo "Using Android NDK: $NDK_PATH"
+
+          # 3. Copy binaries for all 4 ABIs
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            echo "--- Packaging ABI: $ABI ---"
+            
+            # Copy libtdjni.so
+            if [ -f "upstream/src/main/libs/$NDK_DIR/$ABI/libtdjni.so" ]; then
+              cp "upstream/src/main/libs/$NDK_DIR/$ABI/libtdjni.so" "$BUNDLE_DIR/libs/$ABI/"
+            elif [ -f "upstream/src/main/libs/$NDK_DIR/libs/$ABI/libtdjni.so" ]; then
+              cp "upstream/src/main/libs/$NDK_DIR/libs/$ABI/libtdjni.so" "$BUNDLE_DIR/libs/$ABI/"
+            else
+              echo "ERROR: libtdjni.so not found for $ABI in $NDK_DIR"
+              exit 1
+            fi
+
+            # Copy libcryptox.so and libsslx.so
+            if [ -f "upstream/openssl/$NDK_DIR/$ABI/lib/libcryptox.so" ]; then
+              cp "upstream/openssl/$NDK_DIR/$ABI/lib/libcryptox.so" "$BUNDLE_DIR/libs/$ABI/"
+              cp "upstream/openssl/$NDK_DIR/$ABI/lib/libsslx.so" "$BUNDLE_DIR/libs/$ABI/"
+            elif [ -f "upstream/openssl/$NDK_DIR/$ABI/libcryptox.so" ]; then
+              cp "upstream/openssl/$NDK_DIR/$ABI/libcryptox.so" "$BUNDLE_DIR/libs/$ABI/"
+              cp "upstream/openssl/$NDK_DIR/$ABI/libsslx.so" "$BUNDLE_DIR/libs/$ABI/"
+            else
+              echo "ERROR: OpenSSL libraries not found for $ABI in $NDK_DIR"
+              exit 1
+            fi
+
+            # Map ABI to NDK sysroot target triplet for libc++_shared.so
+            case "$ABI" in
+              arm64-v8a)   TRIPLET="aarch64-linux-android" ;;
+              armeabi-v7a) TRIPLET="arm-linux-androideabi" ;;
+              x86_64)      TRIPLET="x86_64-linux-android" ;;
+              x86)         TRIPLET="i686-linux-android" ;;
+            esac
+
+            LIBCXX=$(find "$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot" -name "libc++_shared.so" | grep -F "$TRIPLET" | head -n 1)
+            if [ -z "$LIBCXX" ] || [ ! -f "$LIBCXX" ]; then
+              LIBCXX=$(find "$ANDROID_HOME" -name "libc++_shared.so" | grep -F "$TRIPLET" | head -n 1)
+            fi
+
+            if [ -n "$LIBCXX" ] && [ -f "$LIBCXX" ]; then
+              echo "Found libc++_shared.so for $ABI ($TRIPLET): $LIBCXX"
+              cp "$LIBCXX" "$BUNDLE_DIR/libs/$ABI/libc++_shared.so"
+            else
+              echo "ERROR: libc++_shared.so not found for $ABI ($TRIPLET)!"
+              exit 1
+            fi
+
+            # Strip debug symbols from all shared libraries using NDK llvm-strip or system strip
+            STRIP_TOOL=$(find "$NDK_PATH" -name "llvm-strip" | head -n 1)
+            if [ -z "$STRIP_TOOL" ]; then
+              STRIP_TOOL="strip"
+            fi
+            "$STRIP_TOOL" --strip-all "$BUNDLE_DIR/libs/$ABI/"*.so || true
+          done
+
+      - name: Quality Gate Verification
+        if: steps.version_check.outputs.should_run == 'true'
+        run: |
+          echo "=== Quality Gate Verification ==="
+          FAIL=0
+          
+          # Check Java bindings
+          for JFILE in Client.java TdApi.java; do
+            P="bundle/java/org/drinkless/tdlib/$JFILE"
+            if [ ! -s "$P" ]; then
+              echo "❌ Assertion failed: $P is missing or empty"
+              FAIL=1
+            else
+              SIZE=$(stat -c%s "$P")
+              echo "✅ Verified Java: $P ($SIZE bytes)"
+            fi
+          done
+
+          # Check .so libraries (4 per ABI * 4 ABIs = 16 files)
+          for ABI in arm64-v8a armeabi-v7a x86_64 x86; do
+            for LIB in libtdjni.so libcryptox.so libsslx.so libc++_shared.so; do
+              P="bundle/libs/$ABI/$LIB"
+              if [ ! -s "$P" ]; then
+                echo "❌ Assertion failed: $P is missing or empty"
+                FAIL=1
+              else
+                SIZE=$(stat -c%s "$P")
+                if [ "$SIZE" -lt 50000 ]; then
+                  echo "❌ Assertion failed: $P is suspiciously small ($SIZE bytes), likely an un-smudged LFS pointer!"
+                  FAIL=1
+                else
+                  echo "✅ Verified Binary: $P ($SIZE bytes)"
+                fi
+              fi
+            done
+          done
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "Quality Gate Failed! Missing required binaries or sources."
+            exit 1
+          fi
+
+          echo "All 16 native libraries and 2 Java bindings successfully verified!"
+
+      - name: Create release zip bundle
+        if: steps.version_check.outputs.should_run == 'true'
+        run: |
+          ZIP_NAME="${{ steps.version_check.outputs.zip_filename }}"
+          echo "Creating zip archive $ZIP_NAME..."
+          cd bundle
+          zip -r -9 "../$ZIP_NAME" libs java
+          cd ..
+          ls -lh "$ZIP_NAME"
+
+      - name: Generate Checksums & Release Notes
+        if: steps.version_check.outputs.should_run == 'true'
+        id: notes
+        run: |
+          ZIP_NAME="${{ steps.version_check.outputs.zip_filename }}"
+          TDLIB_VER="${{ steps.version_check.outputs.tdlib_version }}"
+          COMMIT_HASH="${{ steps.version_check.outputs.commit_hash }}"
+          SHORT_COMMIT="${{ steps.version_check.outputs.short_commit }}"
+
+          SHA256=$(sha256sum "$ZIP_NAME" | awk '{print $1}')
+          MD5=$(md5sum "$ZIP_NAME" | awk '{print $1}')
+          SIZE=$(du -h "$ZIP_NAME" | awk '{print $1}')
+
+          cat << 'EOF' > release_notes.md
+          ## TDLib Prebuilt Bundle `v__VER__`
+
+          Automated packaging of official prebuilt TDLib binaries and Java bindings from [`TGX-Android/tdlib`](https://github.com/TGX-Android/tdlib).
+
+          ### Upstream Provenance
+          * **TDLib Version:** `__VER__`
+          * **Upstream TDLib Commit:** [`__SHORT_COMMIT__`](https://github.com/tdlib/td/commit/__COMMIT__) (`__COMMIT__`)
+          * **Source Repository:** [TGX-Android/tdlib](https://github.com/TGX-Android/tdlib)
+          * **Bundle Archive:** `__ZIP__` (__SIZE__)
+
+          ### Included Architectures & Binaries
+          Every ABI (`arm64-v8a`, `armeabi-v7a`, `x86_64`, `x86`) includes:
+          - `libtdjni.so` (TDLib core engine)
+          - `libcryptox.so` (OpenSSL Crypto)
+          - `libsslx.so` (OpenSSL TLS)
+          - `libc++_shared.so` (LLVM C++ Runtime)
+
+          ### Checksums
+          | File | Algorithm | Hash |
+          | :--- | :--- | :--- |
+          | `__ZIP__` | **SHA-256** | `__SHA256__` |
+          | `__ZIP__` | **MD5** | `__MD5__` |
+
+          ### How to Use in Android Projects
+          1. Download and extract `__ZIP__`.
+          2. Copy `libs/*` into your project's `app/src/main/jniLibs/`.
+          3. Copy `java/*` into your project's `app/src/main/java/`.
+          EOF
+
+          sed -i "s/__VER__/$TDLIB_VER/g" release_notes.md
+          sed -i "s/__COMMIT__/$COMMIT_HASH/g" release_notes.md
+          sed -i "s/__SHORT_COMMIT__/$SHORT_COMMIT/g" release_notes.md
+          sed -i "s/__ZIP__/$ZIP_NAME/g" release_notes.md
+          sed -i "s/__SIZE__/$SIZE/g" release_notes.md
+          sed -i "s/__SHA256__/$SHA256/g" release_notes.md
+          sed -i "s/__MD5__/$MD5/g" release_notes.md
+
+      - name: Publish GitHub Release
+        if: steps.version_check.outputs.should_run == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          RELEASE_TAG="${{ steps.version_check.outputs.release_tag }}"
+          ZIP_NAME="${{ steps.version_check.outputs.zip_filename }}"
+
+          echo "Publishing release $RELEASE_TAG with $ZIP_NAME..."
+
+          if gh release view "$RELEASE_TAG" > /dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists. Updating release notes and re-uploading asset..."
+            gh release edit "$RELEASE_TAG" --notes-file release_notes.md --title "TDLib $RELEASE_TAG"
+            gh release upload "$RELEASE_TAG" "$ZIP_NAME" --clobber
+          else
+            echo "Creating new release $RELEASE_TAG..."
+            gh release create "$RELEASE_TAG" "$ZIP_NAME" \
+              --title "TDLib $RELEASE_TAG" \
+              --notes-file release_notes.md
+          fi
+          echo "Release successfully published!"

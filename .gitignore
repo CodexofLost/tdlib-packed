@@ -1,0 +1,14 @@
+# Build & bundle artifacts
+bundle/
+upstream/
+*.zip
+*.tar.gz
+release_notes.md
+
+# OS / Editor metadata
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/
